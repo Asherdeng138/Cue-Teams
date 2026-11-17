@@ -1,5 +1,9 @@
 # Cue Teams — Teams 桌面字幕保存
 
+**直接使用： [下载 Windows 便携版](https://github.com/Asherdeng138/Cue-Teams/releases/latest/download/Cue-Teams-Windows-x64.zip)** · [版本与更新说明](https://github.com/Asherdeng138/Cue-Teams/releases)
+
+Windows 10 / 11 x64：下载 ZIP → 右键“全部解压缩” → 打开解压后的 `Cue-Teams` 文件夹 → 双击 `CueTeams.exe`。无需安装 Python、Ollama 或浏览器插件。请保留整个文件夹和 `_internal`，并在 Teams 会议里开启实时字幕。GitHub 的“Source code”是开发源码，普通用户下载上面的 Windows 便携版即可。
+
 将 Microsoft Teams **桌面客户端已经生成的实时字幕**保存为本地 TXT 和 JSON，尽可能保留 Teams 提供的发言人姓名。无需浏览器插件，也不重新进行语音识别。
 
 A Windows desktop tool that saves Microsoft Teams' own live captions locally, with the speaker labels exposed by Teams.
@@ -79,10 +83,10 @@ $env:CUE_RECORDINGS_DIR = Join-Path $env:TEMP ('cue-test-recordings-' + [guid]::
 ## 构建便携版
 
 ```powershell
-.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm CueTeams.spec
+.\.venv\Scripts\python.exe scripts/build_portable.py
 ```
 
-生成 `dist/Cue-Teams/CueTeams.exe`。分发或移动时必须保留整个 `dist/Cue-Teams/`，包括 `_internal/`；不要只复制 EXE。源码包没有包含预编译程序或运行时依赖。
+生成 `dist/Cue-Teams/CueTeams.exe`、`dist/Cue-Teams-Windows-x64.zip` 及 SHA256 校验文件。脚本收集依赖许可，排除用户数据，并打包完整运行目录。分发或移动时必须保留整个 `dist/Cue-Teams/`，包括 `_internal/`；不要只复制 EXE。源码包没有包含预编译程序或运行时依赖。
 
 构建配置排除音频转录引擎。发布二进制前另行核对实际打包依赖及其许可证，参见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 

@@ -1,0 +1,6 @@
+# Keep source checksums reproducible across Windows and Linux checkouts.
+* text=auto eol=lf
+*.ico binary
+/LICENSE -text
+/docs/upstream/THIRD-PARTY-NOTICES.md -text
+/docs/licenses/*.terms -text

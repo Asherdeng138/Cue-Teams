@@ -21,6 +21,13 @@ icon, not Python packages, a Python runtime, or compiled application binaries.
 package remains subject to its own license; the application MIT license does not
 replace dependency licenses.
 
+The portable release produced by `scripts/build_portable.py` additionally includes
+the `licenses/` directory and `BUILD-DEPENDENCIES.json`: CPython, Tcl/Tk and license
+files collected conservatively for installed build-environment packages. Some
+listed packages are build tools or are pruned from the final binary. Preserve these
+notices when redistributing the portable ZIP. Tcl and Tk license texts are also
+retained at `docs/licenses/` in this source repository.
+
 `CueTeams.spec` excludes audio engines including PyAV / FFmpeg, faster-whisper,
 ctranslate2, onnxruntime, soundcard, torch and numpy. Retained upstream modules
 still import AI clients and document-processing libraries. A binary publisher must
