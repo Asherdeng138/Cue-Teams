@@ -1,0 +1,586 @@
+﻿# Extract text from a meeting window via Windows UI Automation.
+#
+# Two modes, both ending in "walk an element's accessibility tree and print its text":
+#
+#   -WindowTitle "<substring>"    read the top-level window whose title matches.
+#                                 This is what the "Pick a window..." source uses.
+#   -TeamsMode                    find Teams however it presents itself today, then
+#                                 narrow to the captions pane if one is exposed.
+#   -ZoomMode                     find the Zoom desktop client's meeting window and
+#                                 read its caption overlay, one caption per list item.
+#
+# Why -TeamsMode exists: this script used to look for a top-level window titled
+# "Captions". The current Teams client (ms-teams) has no such window -- captions are a
+# pane inside the meeting window -- so the lookup always failed with "No window found"
+# and the Teams source could never have worked. Classic Teams did pop out a Captions
+# window, hence the original assumption.
+#
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File extract_teams_transcript.ps1 -TeamsMode
+#   powershell -ExecutionPolicy Bypass -File extract_teams_transcript.ps1 -WindowTitle "Zoom Meeting"
+
+param(
+    [string]$OutPath = "",
+    # Substring of the target window's title. Ignored when -TeamsMode finds Teams.
+    [string]$WindowTitle = "Captions",
+    # Locate Teams by process/title rather than requiring a "Captions" window.
+    [switch]$TeamsMode,
+    # Processes that count as Teams. ms-teams is the current client, Teams the classic one.
+    [string[]]$TeamsProcess = @('ms-teams', 'Teams'),
+    # Locate the Zoom desktop client's meeting window and read its caption overlay.
+    [switch]$ZoomMode,
+    [string[]]$ZoomProcess = @('Zoom'),
+    # Scroll the pane from top to bottom, reading at each step, and write every pass.
+    # For a recording's Transcript pane, which is virtualized: only the entries on
+    # screen exist in the accessibility tree, so one read gets ~2 minutes of a 2-hour
+    # meeting. Progress is reported as JSON Lines on stdout for the parent to show.
+    [switch]$Collect,
+    [int]$MaxPasses = 400,
+    [int]$SettleMs = 650,
+    [int]$WheelNotches = 5
+)
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+# Mouse, keyboard and window control for -Collect only; loaded there (see below).
+$Win32Sig = @'
+[DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+
+function Emit([hashtable]$obj) {
+    # One JSON object per line; ConvertTo-Json escapes non-ASCII, so the pipe is safe.
+    Write-Output ($obj | ConvertTo-Json -Compress)
+}
+
+function Stop-NothingToRead([string]$Message) {
+    # Nothing to read yet: the window is not open, or its captions are off. That is not
+    # a fault, so live polling gets exit code 2 and one plain line on stderr, which Cue
+    # shows as its status. Write-Error prefixed the script's path and wrapped the line,
+    # so the status bar showed the path and cut the advice off. The recording import
+    # reads JSON lines, so -Collect reports it the way its other errors are reported.
+    if ($Collect) {
+        Emit @{ type = "error"; message = $Message }
+        exit 1
+    }
+    [Console]::Error.WriteLine($Message)
+    exit 2
+}
+
+$ErrorActionPreference = 'Stop'
+
+# Names/automation ids that mark the captions region inside a meeting window.
+$CaptionHints = @('caption', 'live caption', 'closed caption', 'transcript')
+
+function Get-AllText {
+    param([System.Windows.Automation.AutomationElement]$Root)
+
+    $results = [System.Collections.Generic.List[string]]::new()
+    $walker  = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $stack   = [System.Collections.Generic.Stack[System.Windows.Automation.AutomationElement]]::new()
+    $stack.Push($Root)
+
+    while ($stack.Count -gt 0) {
+        $el = $stack.Pop()
+        try {
+            $name = $el.Current.Name
+            $type = $el.Current.ControlType.LocalizedControlType
+        } catch {
+            continue
+        }
+
+        if ($name -and $name.Trim().Length -gt 0) {
+            # Skip generic UI chrome
+            if ($type -notin @('button','menu item','menu bar','tab','tab item','title bar','window','custom','pane','group','image','separator','tool bar','split button','check box','combo box','edit','spin button','progress bar','list','tree','tree item','header','header item','status bar','thumb','scroll bar')) {
+                $results.Add("[$type] $name") | Out-Null
+            } elseif ($type -in @('text','document','edit')) {
+                $results.Add($name) | Out-Null
+            }
+        }
+
+        # A stack pops last-in first, so pushing children first-to-last walked every
+        # sibling group backwards: transcript entries came out newest-first and live
+        # captions were scrambled within each poll. Push in reverse to restore document
+        # order, which is reading order.
+        $kids = [System.Collections.Generic.List[System.Windows.Automation.AutomationElement]]::new()
+        $child = $walker.GetFirstChild($el)
+        while ($child) {
+            $kids.Add($child) | Out-Null
+            $child = $walker.GetNextSibling($child)
+        }
+        for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push($kids[$i]) }
+    }
+
+    return $results
+}
+
+function Count-TextDescendants {
+    # How many text controls sit under $El. Distinguishes a content pane from a label
+    # or tab that merely has "Transcript" as its name.
+    param([System.Windows.Automation.AutomationElement]$El)
+    try {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Text)
+        return $El.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond).Count
+    } catch {
+        return 0
+    }
+}
+
+function Find-CaptionsRegion {
+    <#
+      Narrow a meeting window down to just its captions or transcript pane, when one
+      is exposed. Returns $null if nothing qualifies, so the caller falls back to the
+      whole window and lets downstream filtering deal with the sidebar.
+
+      First version matched the first element *named* like captions and returned it.
+      Against a real recording that was the "Transcript" tab button: zero text under
+      it, so the capture came back empty. A region has to contain text to count.
+    #>
+    param([System.Windows.Automation.AutomationElement]$Window)
+
+    $notRegions = @('button','tab item','hyperlink','menu item','check box','radio button','list item')
+
+    try {
+        $all = $Window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::IsControlElementProperty, $true)))
+    } catch {
+        return $null
+    }
+
+    $best = $null
+    $bestCount = 0
+    foreach ($el in $all) {
+        try {
+            $name = "$($el.Current.Name)".ToLower()
+            $autoId = "$($el.Current.AutomationId)".ToLower()
+            $type = "$($el.Current.ControlType.LocalizedControlType)".ToLower()
+        } catch { continue }
+        if ($type -in $notRegions) { continue }
+
+        $hit = $false
+        foreach ($hint in $CaptionHints) {
+            if ($name -eq $hint -or $autoId.Contains($hint) -or
+                ($name.Contains($hint) -and $name.Length -lt 40)) { $hit = $true; break }
+        }
+        if (-not $hit) { continue }
+
+        $n = Count-TextDescendants -El $el
+        # Prefer the richest candidate: a pane with many lines beats a header with one.
+        if ($n -ge 3 -and $n -gt $bestCount) { $best = $el; $bestCount = $n }
+    }
+    return $best
+}
+
+function Find-ZoomCaptionList {
+    <#
+      Zoom's caption overlay, as the desktop client exposes it: a "CaptionWindow"
+      (class ZConfCCRecieveWndExClass) inside the meeting window, holding a list named
+      "Closed caption" with one list item per caption. The whole thing is absent while
+      captions are off, so $null here means "captions are off", not "wrong window".
+      Class first because it is not localised; the list name is English-only.
+    #>
+    param([System.Windows.Automation.AutomationElement]$Window)
+    $listCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::List)
+    try {
+        $cc = $Window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'ZConfCCRecieveWndExClass')))
+        if ($cc) {
+            $list = $cc.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $listCond)
+            if ($list) { return $list }
+            return $cc
+        }
+        foreach ($l in $Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $listCond)) {
+            if ("$($l.Current.Name)".Trim().ToLower() -eq 'closed caption') { return $l }
+        }
+    } catch {}
+    return $null
+}
+
+function Get-ZoomCaptions {
+    <#
+      One caption per list item. Under each item a text control carries the speaker
+      and an edit control the words, padded with dozens of empty text controls. The
+      item's own name is "Speaker, words", which is the fallback when the children are
+      missing. Emitted as "[speaker] Name" then "[text] words", so the parser has an
+      explicit attribution instead of guessing from line shape: Zoom's one-word replies
+      ("Yeah") are shorter than the speaker's name, which the Teams heuristic reads as
+      "not a speaker".
+    #>
+    param([System.Windows.Automation.AutomationElement]$List)
+    $out = [System.Collections.Generic.List[string]]::new()
+    $itemCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem)
+    $textCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $editCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+    $items = @()
+    try { $items = $List.FindAll([System.Windows.Automation.TreeScope]::Descendants, $itemCond) } catch {}
+    foreach ($item in $items) {
+        try {
+            $speaker = ""
+            $words = ""
+            foreach ($t in $item.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond)) {
+                $n = "$($t.Current.Name)".Trim()
+                if ($n) { $speaker = $n; break }
+            }
+            $e = $item.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+            if ($e) { $words = "$($e.Current.Name)".Trim() }
+            if (-not $words) {
+                $label = "$($item.Current.Name)".Trim()
+                if ($speaker -and $label.StartsWith("$speaker, ")) {
+                    $words = $label.Substring($speaker.Length + 2).Trim()
+                } elseif (-not $speaker) {
+                    $words = $label
+                }
+            }
+            if (-not $words) { continue }
+            if ($speaker) { $out.Add("[speaker] $speaker") | Out-Null }
+            $out.Add("[text] $words") | Out-Null
+        } catch { continue }
+    }
+    return $out
+}
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Window)
+$windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+
+$target = $null
+$strategy = ""
+# Set when the window lookup has already searched for the captions pane, so step 3
+# does not walk the same window a second time.
+$region = $null
+$regionSearched = $false
+
+# 0. Zoom has its own lookup. Only windows owned by the Zoom process count (a browser
+#    tab can be titled "Zoom Meeting" too), the one showing a caption overlay wins, and
+#    the "Zoom Workplace" home window never qualifies on its own.
+if ($ZoomMode) {
+    $zoomPids = @()
+    foreach ($p in $ZoomProcess) {
+        $zoomPids += (Get-Process -Name $p -ErrorAction SilentlyContinue).Id
+    }
+    $zoomWindows = @()
+    foreach ($w in $windows) {
+        try { if ($zoomPids -contains $w.Current.ProcessId) { $zoomWindows += $w } } catch {}
+    }
+    foreach ($w in $zoomWindows) {
+        if (Find-ZoomCaptionList -Window $w) { $target = $w; $strategy = "zoom:captions"; break }
+    }
+    if (-not $target) {
+        foreach ($w in $zoomWindows) {
+            $title = "$($w.Current.Name)".ToLower()
+            $class = "$($w.Current.ClassName)"
+            if ($title -match 'meeting|webinar' -or $class -eq 'ConfMultiTabContentWndClass') {
+                $target = $w; $strategy = "zoom:meeting"; break
+            }
+        }
+    }
+    if (-not $target) {
+        Stop-NothingToRead "Zoom is not in a meeting. Join the meeting and click Show captions; Cue picks the captions up by itself."
+    }
+}
+
+# 1. Title match. Still first, so an actual Captions window (classic Teams, or a
+#    third-party captioner) wins when one exists.
+$titleLower = $WindowTitle.ToLower()
+foreach ($w in $windows) {
+    if ($target) { break }
+    $title = $w.Current.Name
+    if (-not $title) { continue }
+    if ($title.ToLower().Contains($titleLower)) {
+        if ($title -match 'Captions') { $target = $w; $strategy = "title:captions"; break }
+        if (-not $target) { $target = $w; $strategy = "title" }
+    }
+}
+
+# 2. Teams fallback: find the app by process, then by title. Only when asked, so
+#    "Pick a window..." never silently reads something the user did not choose.
+#
+#    Teams often has several windows: the main window plus a popped-out meeting, or a
+#    recording's recap. Taking the first one in z-order picked the main window whenever
+#    it was in front, and the main window has no captions or transcript pane, so a
+#    recording import failed ("found Teams but no transcript pane") and live capture
+#    read the chat list instead of the captions. Prefer the first window that shows a
+#    pane. Later windows are only searched when the first has none, so the usual case
+#    costs the same single search as before.
+if (-not $target -and $TeamsMode) {
+    $teamsPids = @()
+    foreach ($p in $TeamsProcess) {
+        $teamsPids += (Get-Process -Name $p -ErrorAction SilentlyContinue |
+                       Where-Object { $_.MainWindowHandle -ne 0 }).Id
+    }
+    $teamsWindows = @()
+    foreach ($w in $windows) {
+        try { $wpid = $w.Current.ProcessId } catch { continue }
+        if ($teamsPids -contains $wpid) { $teamsWindows += $w }
+    }
+    foreach ($w in $teamsWindows) {
+        $found = Find-CaptionsRegion -Window $w
+        if ($found) { $target = $w; $region = $found; $strategy = "process"; break }
+    }
+    if ($teamsWindows.Count -gt 0) {
+        $regionSearched = $true
+        # No window shows a pane yet (captions off, Transcript tab closed). Keep the front
+        # Teams window as the target so step 3 can say what is missing; it is not read.
+        if (-not $target) { $target = $teamsWindows[0]; $strategy = "process" }
+    }
+    if (-not $target) {
+        foreach ($w in $windows) {
+            $title = "$($w.Current.Name)"
+            if ($title -and $title.ToLower().Contains('microsoft teams')) {
+                $target = $w; $strategy = "title:teams"; break
+            }
+        }
+    }
+}
+
+if (-not $target) {
+    if ($TeamsMode) {
+        Stop-NothingToRead "Teams is not open with a visible window. Open your meeting and turn on live captions."
+    }
+    Stop-NothingToRead "No window found whose title contains '$WindowTitle'. Make sure that window is open and visible."
+}
+
+# 3. Narrow to the captions pane inside the window when it is exposed. Without this a
+#    Teams capture is the whole app: sidebar, chat list, timestamps and all.
+$scope = $target
+if ($ZoomMode) {
+    # The Zoom overlay only exists while captions are on, so "no region" is a clear,
+    # fixable state rather than something to fall back from.
+    $region = Find-ZoomCaptionList -Window $target
+    if (-not $region) {
+        Stop-NothingToRead "Zoom is in a meeting but its captions are off. Click Show captions in the Zoom toolbar; Cue picks them up on the next check."
+    }
+    if ($Collect) {
+        Emit @{ type = "error"; message = "Collecting a full transcript is only supported for Teams recordings." }
+        exit 1
+    }
+    $scope = $region
+} else {
+    if (-not $regionSearched) { $region = Find-CaptionsRegion -Window $target }
+    if ($region) {
+        $scope = $region
+        $strategy += "+captions-pane"
+    }
+}
+
+# Live Teams capture reads the captions pane or nothing. Falling back to the whole window
+# put the chat list, message timestamps and attachment names into the transcript, the AI
+# prompts and the knowledge base whenever the captions were off: a real capture held a
+# private chat, word for word. A real "Captions" window found by title is still read.
+if ($TeamsMode -and -not $Collect -and -not $region -and $strategy -ne "title:captions") {
+    Stop-NothingToRead "Teams is open, but no live captions are showing. In the meeting, turn them on (More > Language and speech > Turn on live captions) and leave them open."
+}
+
+if ([string]::IsNullOrWhiteSpace($OutPath)) {
+    $OutPath = Join-Path $PSScriptRoot 'teams_extracted_raw.txt'
+}
+
+# ---------------------------------------------------------------------------
+# -Collect: scroll the pane top to bottom, reading at every step
+# ---------------------------------------------------------------------------
+if ($Collect) {
+    if (-not $region) {
+        Emit @{ type = "error"; message = ("Cue found Teams but no transcript pane inside it. Open the " +
+            "recording, click the Transcript tab so the text is showing, then try again.") }
+        exit 1
+    }
+
+    # Loaded only here, since only this scroll loop uses them. Loading Windows Forms and
+    # compiling the Win32 helper on every live caption check made each one about 520 ms
+    # instead of 350 ms, and Zoom is now checked every second.
+    Add-Type -AssemblyName System.Windows.Forms
+    $Win32 = Add-Type -MemberDefinition $Win32Sig -Name NativeInput -Namespace CueExtract -PassThru
+
+    $textCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $itemCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem)
+    # Entry header: "Name 0 minutes 03 seconds", optionally prefixed by the [type] tag.
+    $HDR = [regex]'^(?:\[[^\]]+\]\s*)?(?<name>[A-Z][^\d]{1,60}?)\s*(?:(?<h>\d+)\s*hours?\s*)?(?<m>\d+)\s*minutes?\s*(?<s>\d+)\s*seconds?\.?$'
+
+    # The mouse wheel and keys act on the window in front, so Teams is brought forward
+    # only when one of them is about to be used. Scrolling by bringing a line into view
+    # needs neither, and leaves the user's mouse and keyboard alone.
+    $script:inFront = $false
+    function Ensure-Front {
+        if ($script:inFront) { return }
+        try {
+            $hwnd = [IntPtr]$target.Current.NativeWindowHandle
+            $null = $Win32::ShowWindow($hwnd, 9)          # SW_RESTORE
+            $null = $Win32::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 400
+        } catch {}
+        $script:inFront = $true
+    }
+
+    # Transcript lines, in the current Teams: list items whose automation ids number the
+    # entries from the start ("itemHeader-12", "sub-entry-12"). Older Teams exposed text
+    # elements with no ids; every helper below falls back to document order then.
+    function Get-Items($scope) {
+        try { return @($scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $itemCond)) } catch { return @() }
+    }
+    function Get-EntryIndex($el) {
+        try { if ("$($el.Current.AutomationId)" -match '^(?:sub-entry|itemHeader)-(\d+)$') { return [int]$Matches[1] } } catch {}
+        return -1
+    }
+    function Bring-IntoView($el) {
+        try { $el.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern).ScrollIntoView(); return $true } catch { return $false }
+    }
+
+    function Wheel($el, [int]$notches) {
+        Ensure-Front
+        # Negative notches scroll down.
+        $r = $el.Current.BoundingRectangle
+        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+        $delta = if ($notches -lt 0) { -120 } else { 120 }
+        for ($i = 0; $i -lt [math]::Abs($notches); $i++) { $Win32::mouse_event(0x0800, 0, 0, $delta, 0); Start-Sleep -Milliseconds 40 }
+    }
+    function Keys([System.Windows.Automation.AutomationElement]$el, [string]$keys) {
+        Ensure-Front
+        try { $el.SetFocus() } catch {}
+        Start-Sleep -Milliseconds 120
+        [System.Windows.Forms.SendKeys]::SendWait($keys)
+    }
+    function HeaderKeys([string[]]$lines) {
+        $keys = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($l in $lines) {
+            $m = $HDR.Match($l)
+            if (-not $m.Success) { continue }
+            $h = 0; if ($m.Groups['h'].Success) { $h = [int]$m.Groups['h'].Value }
+            $secs = $h * 3600 + [int]$m.Groups['m'].Value * 60 + [int]$m.Groups['s'].Value
+            $null = $keys.Add("$($m.Groups['name'].Value.Trim().ToLower())|$secs")
+        }
+        return $keys
+    }
+
+    # Start from the top: bring the first transcript line into view. The wheel and
+    # Ctrl+Home are the fallback when the pane has no list items to aim at.
+    $firstItems = Get-Items $region
+    if (-not ($firstItems.Count -gt 0 -and (Bring-IntoView $firstItems[0]))) {
+        Wheel $region 60; Start-Sleep -Milliseconds $SettleMs
+        Keys $region "^{HOME}"
+    }
+    Start-Sleep -Milliseconds $SettleMs
+
+    # How the pane moves forward. "lastline" brings the last transcript line on screen
+    # into view, so the next lines render below it and nothing can be jumped over.
+    #
+    # The previous loop moved by mouse wheel first. A 1 h 45 min meeting showed both of
+    # its faults: five notches sometimes scrolled further than the pane shows, leaving
+    # 4-6 minute holes, and when the wheel stalled its fallback brought the last *text*
+    # element into view. In the current Teams the lines are list items and the only text
+    # elements are the pane's header notes, so that jumped back to the top; four quiet
+    # passes later the run ended at 34:06 and reported itself done.
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $seenIdx = New-Object 'System.Collections.Generic.HashSet[int]'
+    $all = New-Object 'System.Collections.Generic.List[string]'
+    $stall = 0; $method = "lastline"; $maxSec = 0; $maxIdx = -1; $gaps = 0; $p = 0
+    for ($p = 1; $p -le $MaxPasses; $p++) {
+        # Elements go stale as the list virtualizes; re-find the pane every pass.
+        $scopeNow = Find-CaptionsRegion -Window $target
+        if (-not $scopeNow) { $scopeNow = $region }
+        try { $lines = Get-AllText -Root $scopeNow } catch { $lines = @() }
+
+        $all.Add("--- pass $p ---") | Out-Null
+        foreach ($l in $lines) { $all.Add($l) | Out-Null }
+
+        $new = 0
+        foreach ($k in HeaderKeys $lines) {
+            if ($seen.Add($k)) { $new++; $s = [int]($k.Split('|')[1]); if ($s -gt $maxSec) { $maxSec = $s } }
+        }
+
+        # Numbered lines show exactly what has been read. Anything missing between the
+        # furthest line read before and the furthest one now was jumped over.
+        $items = Get-Items $scopeNow
+        $passMax = -1
+        foreach ($it in $items) {
+            $i = Get-EntryIndex $it
+            if ($i -ge 0) { $null = $seenIdx.Add($i); if ($i -gt $passMax) { $passMax = $i } }
+        }
+        $skipped = 0
+        if ($maxIdx -ge 0 -and $passMax -gt $maxIdx) {
+            for ($i = $maxIdx + 1; $i -lt $passMax; $i++) { if (-not $seenIdx.Contains($i)) { $skipped++ } }
+        }
+        $advanced = ($new -gt 0) -or ($passMax -gt $maxIdx)
+        Emit @{ type = "progress"; pass = $p; entries = $seen.Count; new = $new; max_seconds = $maxSec; method = $method; last_line = $passMax }
+
+        if ($skipped -gt 0 -and $gaps -lt 20) {
+            # Step back over the gap and read it before going on.
+            $gaps++
+            Wheel $scopeNow 2
+            Start-Sleep -Milliseconds $SettleMs
+            continue
+        }
+        if ($passMax -gt $maxIdx) { $maxIdx = $passMax }
+
+        if ($advanced) { $stall = 0; $method = "lastline" } else { $stall++ }
+        # The true end looks the same as a scroll that did not take, so every way of
+        # moving gets a turn before the run counts as finished.
+        if ($stall -ge 4) { break }
+        if ($stall -eq 2) { $method = "wheel" }
+        elseif ($stall -eq 3) { $method = "pagedown" }
+
+        switch ($method) {
+            "lastline" {
+                $moved = $false
+                if ($items.Count -gt 0) {
+                    $furthest = $items[$items.Count - 1]
+                    foreach ($it in $items) { if ((Get-EntryIndex $it) -eq $passMax) { $furthest = $it } }
+                    $moved = Bring-IntoView $furthest
+                }
+                if (-not $moved) {
+                    # Older Teams: lines were text elements, and the last one was a line.
+                    $texts = $scopeNow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond)
+                    if ($texts.Count -gt 0) { $moved = Bring-IntoView $texts[$texts.Count - 1] }
+                }
+                if (-not $moved) { Wheel $scopeNow (-$WheelNotches) }
+            }
+            "wheel" { Wheel $scopeNow (-3) }
+            "pagedown" { Keys $scopeNow "{PGDN}" }
+        }
+        Start-Sleep -Milliseconds $SettleMs
+    }
+
+    $all -join "`n" | Out-File -FilePath $OutPath -Encoding utf8
+    # The window title names the meeting ("KPI review | Contoso | ... | Microsoft Teams"),
+    # which the import window uses to name the downloaded file.
+    $windowTitle = ""
+    try { $windowTitle = "$($target.Current.Name)" } catch {}
+    Emit @{ type = "done"; passes = $p; entries = $seen.Count; max_seconds = $maxSec; path = $OutPath; window = $windowTitle; last_line = $maxIdx; gaps_backed_over = $gaps }
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Single read (live caption polling)
+# ---------------------------------------------------------------------------
+Write-Host "Found window: $($target.Current.Name) [$strategy]" -ForegroundColor Cyan
+Write-Host "Walking accessibility tree (this can take a few seconds)..." -ForegroundColor Cyan
+
+if ($ZoomMode) {
+    $lines = Get-ZoomCaptions -List $scope
+} else {
+    $lines = Get-AllText -Root $scope
+}
+Write-Host "Captured $($lines.Count) text elements." -ForegroundColor Green
+
+$lines -join "`n" | Out-File -FilePath $OutPath -Encoding utf8
+Write-Host "Saved raw extract to: $OutPath" -ForegroundColor Green

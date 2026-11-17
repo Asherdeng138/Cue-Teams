@@ -1,0 +1,33 @@
+name: Windows caption tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-teams-lock.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-teams-lock.txt
+      - name: Check public source
+        run: python scripts/check_public_source.py
+      - name: Test isolated app data
+        shell: pwsh
+        run: |
+          $env:CUE_DATA_DIR = Join-Path $env:RUNNER_TEMP 'cue-test-data'
+          $env:CUE_RECORDINGS_DIR = Join-Path $env:RUNNER_TEMP 'cue-test-recordings'
+          python -m pytest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python teams_app.py --self-test

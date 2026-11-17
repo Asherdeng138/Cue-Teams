@@ -1,0 +1,1495 @@
+"""Live captions capture — polls the meeting app's captions (Teams, Zoom, or any
+window you pick) and appends new caption lines as they arrive. A captions pane
+only shows a few lines at a time, so this needs to keep up while the meeting is
+running.
+
+Run:  python live_capture.py
+"""
+
+import os
+# Avoid OpenMP duplicate-library segfaults on Windows + Anaconda.
+# Must be set BEFORE any import that pulls in numpy/torch.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import difflib
+import queue
+import re
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import config as cfg_mod
+import knowledge_base as kb
+import transcript_cleaner
+import transcript_export
+import window_capture
+import worker_ipc
+import teams_caption
+from auto_assist import LiveAssistPanel
+from settings_window import SettingsWindow
+from summarize import (
+    SummaryWindow,
+    get_api_key,
+    list_ollama_models,
+    pick_default_ollama_model,
+    prompt_for_api_key,
+    set_api_key,
+)
+
+
+def _resource_dir() -> Path:
+    """Where bundled read-only resources live. Handles PyInstaller (frozen) and source runs."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller: onefile extracts to _MEIPASS; onedir puts data under the exe dir.
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent
+
+
+# Read-only bundled resources
+EXTRACT_PS1 = _resource_dir() / "extract_teams_transcript.ps1"
+ICON_PATH = _resource_dir() / "cue.ico"
+# Writable scratch file — never inside the (possibly read-only) bundle. On DATA_DIR (off-C when configured).
+WRITABLE_DIR = cfg_mod.DATA_DIR
+RAW_TXT = WRITABLE_DIR / "teams_extracted_raw.txt"
+SPEAKER_RE = re.compile(r"^[A-Z][\w'’\-\.]+(?:\s+[A-Z][\w'’\-\.]+)*$")
+LABEL_RE = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
+# Tenant, room or workspace labels that show up in the accessibility tree and are not
+# speech. These are specific to your organisation, so add your own in
+# Settings -> config.json under capture.ignore_lines rather than hardcoding them here.
+ROOM_LABELS = {"Untitled"}
+
+
+def _configured_ignores() -> set[str]:
+    try:
+        return {s.strip() for s in cfg_mod.get_config()["capture"].get("ignore_lines", []) if s.strip()}
+    except Exception:
+        return set()
+
+# Teams puts a speaker's name alone on the line above their caption, so "a short
+# capitalised line" is the only shape we have to go on. Trouble is a one-word
+# utterance looks identical: replaying a real capture, "Thanks" became a speaker and
+# swallowed the next line as its caption. Shape can't separate these, so exclude the
+# common utterances by name.
+NOT_SPEAKER = frozenset("""
+thanks thank ok okay yes no yeah yep nope right sure hello hi hey sorry please
+exactly correct perfect great good nice cool wow true false maybe well so and but
+actually anyway alright absolutely agreed understood indeed same congratulations
+bye goodbye welcome morning afternoon evening night oh ah um uh hmm mhm yay oops
+""".split())
+
+# Multi-word phrases that pass the capitalised-words shape test but are speech.
+NOT_SPEAKER_PHRASES = frozenset({
+    "thank you", "thanks a lot", "thank you so much", "good morning",
+    "good afternoon", "good evening", "good night", "see you", "talk soon",
+    "got it", "makes sense", "fair enough", "no worries", "no problem",
+    "sounds good", "will do", "hold on", "go ahead", "one moment", "let me see",
+    "sorry about that", "excuse me", "over to you", "you too", "same here",
+})
+
+
+# UI Automation reads whatever text a window exposes, which includes the app's own
+# furniture. Replaying a real capture, the transcript picked up "Type a message",
+# message timestamps and the whole chat sidebar, all of which then went into the LLM
+# prompt as if someone had said it.
+#
+# Deliberately conservative: only whole-line matches for phrases that are unambiguously
+# chrome. Bare words like "Chats" or "You" are left alone, because a caption line can
+# legitimately be one word and dropping real speech is worse than keeping some noise.
+UI_CHROME = frozenset({
+    "type a message", "type a new message", "more options", "show more", "show less",
+    "raise hand", "meeting chat", "live captions", "turn off live captions",
+    "new message", "unread", "sent", "delivered", "edited", "seen",
+    "drafts", "favorites", "type a message to reply", "reply in thread",
+})
+
+# A line that is only a timestamp: "Yesterday at 11:55 PM.", "11:26 PM", "Today 09:03".
+TIMESTAMP_ONLY_RE = re.compile(
+    r"^(?:yesterday|today|tomorrow|mon|tue|wed|thu|fri|sat|sun\w*)?\s*"
+    r"(?:at\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\s*\.?$",
+    re.IGNORECASE,
+)
+
+# A contact row in the chat list, e.g. "Chat Ada Lovelace Offline".
+PRESENCE_ROW_RE = re.compile(
+    r"^chat\b.*\b(available|offline|busy|away|do not disturb|be right back)\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_ui_chrome(line: str) -> bool:
+    """Is this line part of the app's interface rather than something said?"""
+    bare = " ".join(line.split())
+    if not bare:
+        return True
+    if bare.lower().rstrip(".") in UI_CHROME:
+        return True
+    return bool(TIMESTAMP_ONLY_RE.match(bare) or PRESENCE_ROW_RE.match(bare))
+
+
+def looks_like_speaker(line: str) -> bool:
+    """Is this line a speaker label rather than something someone said?"""
+    if not SPEAKER_RE.match(line) or len(line.split()) > 4:
+        return False
+    # Trailing punctuation means it's a sentence, not a name. Keep "J.R." working by
+    # only stripping what ends the line.
+    bare = " ".join(line.split()).rstrip(".!?,;:")
+    if not bare:
+        return False
+    low = bare.lower()
+    return low not in NOT_SPEAKER and low not in NOT_SPEAKER_PHRASES
+
+
+def parse_raw(raw: str) -> list[tuple[str | None, str]]:
+    """Turn the raw extractor output into a list of (speaker, text) pairs.
+    speaker is None for un-attributed lines (e.g. live partial captions).
+
+    A "[speaker] Name" line is an explicit attribution for the line that follows it.
+    The extractor emits it when the app's accessibility tree says who spoke (Zoom
+    keeps the name in its own control), so the shape heuristic below, which exists
+    because Teams gives no such signal, never gets to second-guess it: a one-word
+    reply like "Yeah" is shorter than the speaker's name, which the heuristic reads
+    as "not a speaker" and would leave the name in the transcript as if it were said."""
+    snapshot = teams_caption.read_snapshot(raw)
+    if snapshot is not None:
+        return [(item.speaker, item.text) for item in snapshot[1]]
+    items: list[tuple[str | None, str]] = []
+    # (explicit speaker or None, content)
+    stripped: list[tuple[str | None, str]] = []
+    ignores = _configured_ignores()
+    pending_speaker: str | None = None
+    for ln in raw.splitlines():
+        m = LABEL_RE.match(ln)
+        label_type = m.group(1) if m else None
+        content = (m.group(2) if m else ln).strip()
+        if not content:
+            continue
+        if label_type == "document":
+            continue
+        if label_type == "speaker":
+            pending_speaker = content
+            continue
+        if content in ROOM_LABELS or content in ignores:
+            continue
+        if is_ui_chrome(content):
+            continue
+        stripped.append((pending_speaker, content))
+        pending_speaker = None
+
+    i = 0
+    while i < len(stripped):
+        explicit, cur = stripped[i]
+        if explicit:
+            items.append((explicit, cur))
+            i += 1
+            continue
+        is_speaker = (
+            looks_like_speaker(cur)
+            and i + 1 < len(stripped)
+            and stripped[i + 1][0] is None
+            and len(stripped[i + 1][1]) > len(cur)
+        )
+        if is_speaker:
+            items.append((cur, stripped[i + 1][1]))
+            i += 2
+        else:
+            items.append((None, cur))
+            i += 1
+    return items
+
+
+def normalize_text(t: str) -> str:
+    """Loose key for dedup — collapse whitespace, lowercase, strip punctuation."""
+    return teams_caption.normalize(t)
+
+
+def is_revision_of(prev_text: str, new_text: str) -> bool:
+    """True if new_text looks like a continuation/revision of prev_text
+    (Teams often types out captions progressively)."""
+    a, b = normalize_text(prev_text), normalize_text(new_text)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if b.startswith(a):
+        return True
+    if a.startswith(b):
+        return True
+    # last 30 chars of prev appear at the start of new (overlap revision)
+    if len(a) >= 30 and a[-30:] in b[:60]:
+        return True
+    return False
+
+
+def merge_caption(prev_text: str, new_text: str) -> str | None:
+    """What a caption entry should hold once new_text arrives, or None if new_text is a
+    different caption.
+
+    - grown: new_text starts with prev_text, as captions do while someone talks.
+    - stale: prev_text already starts with new_text. Nothing new; keep prev_text.
+    - corrected: same first word, and at least 70% of the shorter one's words shared, as
+      when Zoom turns "10 see it" into "10 seats" (the prefix rule misses that). Under
+      four words only grown or stale count, since "I think so" and "I think we should
+      ship" are two different things said.
+    - continued: new_text starts with the last five or more words of prev_text, as a
+      long Teams caption rolls on. is_revision_of replaced prev_text with new_text there
+      and lost its beginning; replaying real captures showed it, so the two are joined.
+    """
+    a, b = normalize_text(prev_text), normalize_text(new_text)
+    if not a or not b:
+        return None
+    if b.startswith(a):
+        return new_text
+    if a.startswith(b):
+        return prev_text
+    pw, nw = prev_text.split(), new_text.split()
+    pn, nn = [normalize_text(w) for w in pw], [normalize_text(w) for w in nw]
+    if min(len(pn), len(nn)) >= 4 and pn[0] == nn[0]:
+        matcher = difflib.SequenceMatcher(None, pn, nn, autojunk=False)
+        shared = sum(m.size for m in matcher.get_matching_blocks())
+        if shared / min(len(pn), len(nn)) >= 0.7:
+            return new_text
+    for k in range(min(len(pn), len(nn) - 1), 4, -1):
+        if pn[-k:] == nn[:k]:
+            return " ".join(pw + nw[k:])
+    return None
+
+
+def revises(prev_text: str, new_text: str) -> bool:
+    """Is new_text a later version of the same caption as prev_text?"""
+    return merge_caption(prev_text, new_text) is not None
+
+
+# How far back a caption may reach to revise an earlier one. Zoom keeps rewriting its
+# last two or three captions, not only the newest, so a correction can arrive after
+# someone else's line; comparing with the last entry alone kept both versions.
+REVISION_LOOKBACK = 6
+
+# Zoom's overlay holds only its last two or three captions, so quick replies scrolled
+# away between checks every few seconds. One Zoom check takes about 350 ms.
+ZOOM_POLL_MS = 1000
+
+
+class LiveCapture:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Cue  ·  by Digitalgrub")
+        root.geometry("1240x800")
+        root.minsize(960, 600)
+
+        cfg = cfg_mod.get_config()
+        self.poll_seconds = tk.IntVar(value=cfg["cadence"].get("caption_poll_sec", 4))
+        self.running = False
+        self.poll_after_id: str | None = None
+        self.queue: queue.Queue = queue.Queue()
+        self.captured: list[tuple[str | None, str]] = []  # ordered final list
+        self.seen_norm: set[str] = set()  # normalized texts already captured
+        self.last_poll_time: datetime | None = None
+        self.error_count = 0
+        # Parallel to captured: the Text-widget tag of each live caption, so a revision can
+        # rewrite that entry in place. None for imported or Whisper text, which is final.
+        self._entry_tags: list[str | None] = []
+        self._tag_seq = 0
+        # True while an extractor run is in flight; a poll never starts a second one.
+        self._extract_busy = False
+        self._teams_ledger = teams_caption.CaptionLedger()
+        self._teams_indices: dict[int, int] = {}
+        self.whisper = None  # lazy-initialized Whisper capture
+        self.capture_window_title = "Captions"  # which window the UIA poller reads
+        self.teams_mode = True  # let the extractor find Teams by process, not by title
+        self.zoom_mode = False  # read the Zoom desktop client's caption overlay instead
+
+        # Auto-indexing of the in-progress transcript into the KB
+        self.meeting_id: str | None = None
+        self.last_indexed_doc_id: str | None = None
+        self.auto_index_interval_sec = int(cfg["cadence"].get("auto_index_interval_sec", 600))
+        self.auto_index_after_id: str | None = None
+        self.auto_index_min_chars = 800
+
+        # Shared state vars referenced across the UI
+        self.source_var = tk.StringVar(value="Teams desktop")
+        initial_backend = cfg["llm"].get("backend", "ollama").capitalize()
+        self.backend_var = tk.StringVar(
+            value=initial_backend if initial_backend in ("Auto", "Claude", "Ollama") else "Ollama"
+        )
+        self.ollama_model_var = tk.StringVar(value="")
+        self._ollama_models_cache: list[str] = []
+        # Transcript only: no assist panel, no AI engine controls, no LLM calls, no
+        # background indexing. Remembered between launches.
+        self.transcript_only = tk.BooleanVar(value=bool(cfg["ui"].get("transcript_only", False)))
+        self._kb_ready = False
+        self.theme_var = tk.StringVar(value=cfg["ui"].get("theme", "light"))
+        self.stats = tk.StringVar(value="0 captions")
+
+        # React to settings changes
+        cfg_mod.on_change(self._on_config_change)
+
+        self._setup_styles()
+        self._build_menubar()
+        self._build_capture_bar(root)
+        # Status bar before the body: pack hands out space in packing order, so a bar
+        # packed after the expanding body vanishes whenever the window is short.
+        self._build_statusbar(root)
+        self._build_body(root)
+        if self.transcript_only.get():
+            self._apply_transcript_only(save=False)
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.after(150, self._drain_queue)
+        self._schedule_auto_index()
+        # Position the split once the window has a real width.
+        root.after(80, self._set_initial_sash)
+        # Warm up the embedding model on the MAIN thread shortly after the UI shows.
+        # Loading off the main thread segfaults on Windows + Anaconda.
+        self.set_status("Loading knowledge-base engine… (one-time, ~5s)")
+        root.after(200, self._warm_kb)
+
+    # ---- Styles ----
+    def _setup_styles(self) -> None:
+        style = ttk.Style()
+        # An accent style for the primary Start button (sv-ttk ships 'Accent.TButton').
+        try:
+            style.configure("Section.TLabel", font=("Segoe UI Semibold", 11))
+            style.configure("Hint.TLabel", foreground="#7a7a7a")
+            style.configure("CaptureBar.TFrame")
+        except tk.TclError:
+            pass
+
+    # ---- Menu bar ----
+    def _build_menubar(self) -> None:
+        menubar = tk.Menu(self.root)
+
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Open transcript file…", accelerator="Ctrl+Shift+O",
+                           command=self.open_transcript_file)
+        m_file.add_command(label="Transcribe a file…", accelerator="Ctrl+O",
+                           command=self.transcribe_file)
+        m_file.add_separator()
+        m_file.add_command(label="Copy transcript", accelerator="Ctrl+C", command=self.copy_all)
+        m_file.add_command(label="Download transcript…", accelerator="Ctrl+S", command=self.save_as)
+        m_file.add_separator()
+        m_file.add_command(label="Clear transcript", command=self.clear)
+        m_file.add_separator()
+        m_file.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=m_file)
+
+        m_kb = tk.Menu(menubar, tearoff=0)
+        m_kb.add_command(label="Add document…", command=self.add_doc)
+        m_kb.add_command(label="Archive current meeting", command=self.archive_now)
+        m_kb.add_separator()
+        m_kb.add_command(label="Manage knowledge base…", command=self.manage_kb)
+        menubar.add_cascade(label="Knowledge Base", menu=m_kb)
+
+        m_tools = tk.Menu(menubar, tearoff=0)
+        m_tools.add_command(label="Summarize now", accelerator="Ctrl+Enter", command=self.summarize)
+        m_tools.add_command(label="Transcribe a file…", command=self.transcribe_file)
+        m_tools.add_command(label="Import Teams recording transcript…",
+                            command=self.import_recording)
+        m_tools.add_command(label="Start Ollama engine", command=self.start_ollama)
+        m_tools.add_separator()
+        m_tools.add_command(label="Settings…", command=self.open_settings)
+        menubar.add_cascade(label="Tools", menu=m_tools)
+
+        m_view = tk.Menu(menubar, tearoff=0)
+        m_view.add_checkbutton(label="Transcript only (AI off)", variable=self.transcript_only,
+                               command=self._apply_transcript_only)
+        m_theme = tk.Menu(m_view, tearoff=0)
+        m_theme.add_radiobutton(label="Light", value="light", variable=self.theme_var,
+                                command=lambda: self._set_theme("light"))
+        m_theme.add_radiobutton(label="Dark", value="dark", variable=self.theme_var,
+                                command=lambda: self._set_theme("dark"))
+        m_view.add_cascade(label="Theme", menu=m_theme)
+        menubar.add_cascade(label="View", menu=m_view)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="About Cue", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=m_help)
+
+        self.root.config(menu=menubar)
+
+        # Keyboard shortcuts
+        self.root.bind_all("<Control-Return>", lambda e: self.summarize())
+        self.root.bind_all("<Control-s>", lambda e: self.save_as())
+        self.root.bind_all("<Control-o>", lambda e: self.transcribe_file())
+        # Shift turns the keysym into a capital O, so this is Ctrl+Shift+O.
+        self.root.bind_all("<Control-O>", lambda e: self.open_transcript_file())
+
+    # ---- Capture bar ----
+    def _build_capture_bar(self, root: tk.Misc) -> None:
+        bar = ttk.Frame(root, padding=(14, 12, 14, 12), style="CaptureBar.TFrame")
+        bar.pack(fill="x")
+
+        # Primary action
+        self.start_btn = ttk.Button(bar, text="▶  Start capturing", command=self.toggle,
+                                     style="Accent.TButton", width=18)
+        self.start_btn.pack(side="left")
+
+        ttk.Label(bar, text="Source").pack(side="left", padx=(16, 6))
+        self.source_box = ttk.Combobox(
+            bar, textvariable=self.source_var, state="readonly",
+            values=["Teams desktop", "Zoom desktop", "Pick a window…", "System audio (Whisper)"],
+            width=20,
+        )
+        self.source_box.pack(side="left")
+        self.source_box.bind("<<ComboboxSelected>>", lambda e: self._on_source_changed())
+
+        # Window picker — only visible when Source = "Pick a window…"
+        self.window_title_var = tk.StringVar(value="")
+        self.window_box = ttk.Combobox(
+            bar, textvariable=self.window_title_var, values=[], width=34, state="readonly"
+        )
+        self.window_box.configure(postcommand=self._refresh_window_list)
+
+        # Recording indicator
+        self.rec_var = tk.StringVar(value="○ Idle")
+        self.rec_label = ttk.Label(bar, textvariable=self.rec_var, foreground="#9a9a9a")
+        self.rec_label.pack(side="left", padx=(16, 0))
+        self._rec_blink_on = False
+        self._rec_after_id: str | None = None
+
+        # The offline path: a file you already have (voice note, recording, meeting
+        # export) rather than audio happening right now.
+        ttk.Button(bar, text="Transcribe a file…", command=self.transcribe_file).pack(
+            side="left", padx=(16, 0)
+        )
+
+        # AI engine group, right-aligned. Hidden in Transcript only mode.
+        self.summarize_btn = ttk.Button(bar, text="✨ Summarize", command=self.summarize)
+        self.ollama_model_box = ttk.Combobox(
+            bar, textvariable=self.ollama_model_var, values=[], width=16, state="readonly"
+        )
+        self.backend_box = ttk.Combobox(
+            bar, textvariable=self.backend_var, values=["Auto", "Claude", "Ollama"],
+            width=8, state="readonly"
+        )
+        ai_label = ttk.Label(bar, text="AI engine")
+        # Packing order matters for side="right": the first one packed sits right-most.
+        self._ai_controls = [
+            (self.summarize_btn, {"side": "right"}),
+            (self.ollama_model_box, {"side": "right", "padx": (6, 12)}),
+            (self.backend_box, {"side": "right", "padx": (0, 0)}),
+            (ai_label, {"side": "right", "padx": (0, 6)}),
+        ]
+        if not self.transcript_only.get():
+            self._show_ai_controls(True)
+            # Asks Ollama for its models over HTTP; skipped entirely when AI is off.
+            self._refresh_ollama_models()
+
+        ttk.Separator(root, orient="horizontal").pack(fill="x")
+
+    # ---- Body (split) ----
+    def _build_body(self, root: tk.Misc) -> None:
+        self.main_paned = ttk.PanedWindow(root, orient="horizontal")
+        self.main_paned.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Left: transcript
+        left = ttk.Frame(self.main_paned, padding=(0, 0, 6, 0))
+        head = ttk.Frame(left)
+        head.pack(fill="x", pady=(0, 6))
+        ttk.Label(head, text="Live transcript", style="Section.TLabel").pack(side="left")
+        ttk.Label(head, text="editable — captions append as they arrive",
+                  style="Hint.TLabel").pack(side="left", padx=(10, 0))
+        # Right above the text it saves, so nobody has to find it in the File menu.
+        self.download_btn = ttk.Button(head, text="⬇  Download", command=self.save_as)
+        self.download_btn.pack(side="right")
+        self.transcript_only_check = ttk.Checkbutton(
+            head, text="Transcript only (AI off)", variable=self.transcript_only,
+            command=self._apply_transcript_only,
+        )
+        self.transcript_only_check.pack(side="right", padx=(0, 12))
+        text_body = ttk.Frame(left)
+        text_body.pack(fill="both", expand=True)
+        self.text = tk.Text(text_body, wrap="word", undo=True, font=("Segoe UI", 11),
+                            relief="flat", borderwidth=1, padx=10, pady=8)
+        scroll = ttk.Scrollbar(text_body, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.main_paned.add(left, weight=3)
+
+        # Right: assist panel
+        self.assist_panel = LiveAssistPanel(
+            self.main_paned,
+            get_transcript=lambda: self.text.get("1.0", "end-1c"),
+            resolve_backend=self._resolve_backend_silent,
+        )
+        # Apply configured cadence at startup (panel defaults are only a fallback).
+        cfg = cfg_mod.get_config()
+        self.assist_panel.brief_interval.set(int(cfg["cadence"].get("brief_interval_sec", 120)))
+        self.assist_panel.questions_interval.set(int(cfg["cadence"].get("questions_interval_sec", 180)))
+        self.assist_panel.points_interval.set(int(cfg["cadence"].get("points_interval_sec", 150)))
+        self.main_paned.add(self.assist_panel, weight=2)
+        # Polling starts after kb.warm_up() finishes (see _warm_kb).
+
+    # ---- Status bar ----
+    def _build_statusbar(self, root: tk.Misc) -> None:
+        bar = ttk.Frame(root, padding=(12, 4, 12, 4))
+        bar.pack(fill="x", side="bottom")
+        self.status = tk.StringVar(value="Ready — choose a source and click Start capturing.")
+        ttk.Label(bar, textvariable=self.status, style="Hint.TLabel").pack(side="left")
+        ttk.Label(bar, textvariable=self.stats, style="Hint.TLabel").pack(side="right")
+        self._refresh_stats()
+
+    def _refresh_stats(self) -> None:
+        """Update the bottom-right summary: captions · KB docs · backend."""
+        try:
+            docs = len(kb.list_documents())
+        except Exception:
+            docs = 0
+        backend = "off" if self.transcript_only.get() else self.backend_var.get()
+        self.stats.set(f"{len(self.captured)} captions  ·  KB: {docs} items  ·  AI: {backend}")
+
+    def _set_initial_sash(self) -> None:
+        try:
+            self.root.update_idletasks()
+            width = self.main_paned.winfo_width()
+            if width > 200:
+                self.main_paned.sashpos(0, int(width * 0.60))
+        except tk.TclError:
+            pass
+
+    def _set_theme(self, mode: str) -> None:
+        try:
+            import sv_ttk
+            sv_ttk.set_theme(mode)
+        except Exception:
+            return
+        self.theme_var.set(mode)
+        cfg = cfg_mod.get_config()
+        cfg["ui"]["theme"] = mode
+        cfg_mod.save_config(cfg)
+        self.set_status(f"Theme: {mode}.")
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            "About Cue",
+            "Cue  ·  by Digitalgrub\n\n"
+            "Your cue to speak. Live meeting captions + an AI running brief,\n"
+            "suggested questions to ask, and on-demand summaries — grounded in\n"
+            "your own documents and past transcripts.\n\n"
+            "Capture: Teams or Zoom desktop (UI Automation), any window, System audio\n"
+            "(Whisper), an audio/video file, or a meeting's transcript file.\n"
+            "AI: Ollama (local, free) or Claude API.\n"
+            "Retrieval: TF-IDF or OpenAI embeddings.\n\n"
+            "Your data stays on this computer unless you enable a cloud AI engine\n"
+            "in Settings. No telemetry. See PRIVACY.md.\n\n"
+            "Cue transcribes everyone in the meeting — get their consent first.\n\n"
+            "MIT licensed."
+        )
+
+    def _warm_kb(self) -> None:
+        try:
+            kb.warm_up()
+            self.set_status("Ready — choose a source and click Start capturing.")
+        except Exception as e:
+            self.set_status(f"KB warm-up failed: {type(e).__name__}: {e}")
+        # Safe to start the assist panel polling now that the model is loaded.
+        self._kb_ready = True
+        if hasattr(self, "assist_panel") and not self.transcript_only.get():
+            self.assist_panel.start()
+
+    def set_status(self, msg: str) -> None:
+        self.status.set(msg)
+
+    def _on_source_changed(self) -> None:
+        """Show the window picker only for the 'Pick a window…' source."""
+        if self.source_var.get() == "Pick a window…":
+            if not self.window_box.winfo_ismapped():
+                self.window_box.pack(side="left", padx=(8, 0), after=self.source_box)
+            self._refresh_window_list()
+        else:
+            try:
+                self.window_box.pack_forget()
+            except tk.TclError:
+                pass
+
+    def _refresh_window_list(self) -> None:
+        try:
+            wins = window_capture.list_windows()
+        except Exception as e:
+            wins = []
+            self.set_status(f"Could not list windows: {e}")
+        self.window_box["values"] = wins
+        if wins and self.window_title_var.get() not in wins:
+            self.window_title_var.set(wins[0])
+
+    def toggle(self) -> None:
+        if self.running:
+            self.stop()
+        else:
+            self.start()
+
+    def _confirm_capture_notice(self) -> bool:
+        """Show the consent notice once. False means don't start capturing.
+
+        Cue transcribes other people, and in many places that needs their consent.
+        Saying so before the first capture is both a Store requirement for products
+        handling personal information and simply the honest thing to do.
+        """
+        cfg = cfg_mod.get_config()
+        if cfg["ui"].get("capture_notice_ack", False):
+            return True
+        agreed = messagebox.askokcancel(
+            "Before you capture",
+            "Cue transcribes what everyone in the meeting says, not just you.\n\n"
+            "In many places, recording or transcribing people without their consent "
+            "is against the law or against your employer's policy, and the rules "
+            "differ by country and state.\n\n"
+            "Please tell the other participants and get their agreement first.\n\n"
+            "Everything stays on this computer unless you switch on a cloud AI "
+            "engine in Settings. See PRIVACY.md for the details.\n\n"
+            "OK to continue. This notice won't appear again.",
+            icon="warning",
+            default="cancel",
+        )
+        if not agreed:
+            self.set_status("Capture cancelled.")
+            return False
+        cfg["ui"]["capture_notice_ack"] = True
+        cfg_mod.save_config(cfg)
+        return True
+
+    def start(self) -> None:
+        if not self._confirm_capture_notice():
+            return
+        source = self.source_var.get()
+        if source == "System audio (Whisper)":
+            self.running = True
+            self.start_btn.configure(text="■  Stop capturing")
+            self._start_rec_blink()
+            self._start_whisper()
+            return
+
+        # UI-Automation sources (Teams desktop / a user-picked window)
+        if source == "Pick a window…":
+            title = self.window_title_var.get().strip()
+            if not title:
+                messagebox.showinfo("Pick a window", "Choose a window to read from first.")
+                return
+            self.capture_window_title = title
+            self.teams_mode = False
+            self.zoom_mode = False
+            label = title if len(title) < 40 else title[:37] + "…"
+            self.status.set(f"Capturing… reading text from “{label}”.")
+        elif source == "Zoom desktop":
+            # The extractor finds Zoom by process and reads its caption overlay; the
+            # title is only a hint for the "Found window" log line.
+            self.capture_window_title = "Zoom Meeting"
+            self.teams_mode = False
+            self.zoom_mode = True
+            self.status.set("Capturing… reading captions from Zoom.")
+        else:  # Teams desktop
+            # Not a window title lookup any more: the current Teams client has no
+            # "Captions" window, so the extractor finds Teams by process instead.
+            self.capture_window_title = "Captions"
+            self.teams_mode = True
+            self.zoom_mode = False
+            self.status.set("Capturing… reading captions from Teams.")
+
+        self.running = True
+        self.start_btn.configure(text="■  Stop capturing")
+        self._start_rec_blink()
+        self._poll()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.poll_after_id:
+            try:
+                self.root.after_cancel(self.poll_after_id)
+            except tk.TclError:
+                pass
+            self.poll_after_id = None
+        if self.whisper is not None:
+            try:
+                self.whisper.stop()
+            except Exception:
+                pass
+            self.whisper = None
+        self._stop_rec_blink()
+        self.start_btn.configure(text="▶  Start capturing")
+        self.status.set(f"Stopped. {len(self.captured)} captions captured.")
+
+    # ---- Recording indicator ----
+    def _start_rec_blink(self) -> None:
+        self._rec_blink_on = True
+        self._blink_rec()
+
+    def _stop_rec_blink(self) -> None:
+        self._rec_blink_on = False
+        if self._rec_after_id:
+            try:
+                self.root.after_cancel(self._rec_after_id)
+            except tk.TclError:
+                pass
+            self._rec_after_id = None
+        self.rec_var.set("○ Idle")
+        try:
+            self.rec_label.configure(foreground="#9a9a9a")
+        except tk.TclError:
+            pass
+
+    def _blink_rec(self) -> None:
+        if not self._rec_blink_on:
+            return
+        # Alternate between solid red dot and dim, ~1s cycle
+        if self.rec_var.get().startswith("●"):
+            self.rec_var.set("○ Recording")
+            color = "#d98a8a"
+        else:
+            self.rec_var.set("● Recording")
+            color = "#e01b1b"
+        try:
+            self.rec_label.configure(foreground=color)
+        except tk.TclError:
+            pass
+        self._rec_after_id = self.root.after(700, self._blink_rec)
+
+    def _start_whisper(self) -> None:
+        # whisper_capture only imports stdlib here; the model and the audio device
+        # live in a child process, so a missing package or a native crash comes back
+        # as a status message rather than taking Cue down.
+        from whisper_capture import WhisperCapture
+
+        self.status.set("Starting the speech engine — first run downloads ~150MB…")
+
+        def on_text(_speaker: str, text: str) -> None:
+            self.root.after(0, lambda t=text: self._append_whisper(t))
+
+        def on_status(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self.set_status(f"Whisper · {m.splitlines()[0]}"))
+
+        def on_error(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self._whisper_failed(m))
+
+        self.whisper = WhisperCapture(
+            on_text=on_text,
+            on_status=on_status,
+            on_error=on_error,
+            model_size="base.en",
+            source="loopback",
+        )
+        self.whisper.start()
+
+    def _whisper_failed(self, message: str) -> None:
+        """The capture worker died. Reset the UI and show the whole explanation."""
+        self.stop()
+        self.set_status("Audio capture failed.")
+        messagebox.showerror("Audio capture failed", message)
+
+    def _append_whisper(self, text: str) -> None:
+        # Treat Whisper output as unattributed captions
+        self._record(None, text, None)
+        self.seen_norm.add(normalize_text(text))
+        at_end = self.text.yview()[1] > 0.98
+        self.text.insert("end", text + "\n\n")
+        if at_end:
+            self.text.see("end")
+        self._refresh_stats()
+
+    def _poll(self) -> None:
+        if not self.running:
+            return
+        # Never two extractor runs at once: they write the same file, and a slow Teams
+        # read could still be running when the next poll came round.
+        if not self._extract_busy:
+            self._extract_busy = True
+            threading.Thread(target=self._do_extract, daemon=True).start()
+        interval = ZOOM_POLL_MS if self.zoom_mode else max(2, self.poll_seconds.get()) * 1000
+        self.poll_after_id = self.root.after(interval, self._poll)
+
+    def _extract_argv(self) -> list[str]:
+        """Command line for one poll of the UI-Automation extractor."""
+        return [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(EXTRACT_PS1),
+            "-OutPath",
+            str(RAW_TXT),
+            "-WindowTitle",
+            self.capture_window_title,
+            # Only the Teams source may fall back to finding the app by process.
+            # A window the user picked is read as picked, never substituted.
+            *(("-TeamsMode",) if self.teams_mode else ()),
+            *(("-ZoomMode",) if self.zoom_mode else ()),
+        ]
+
+    def _do_extract(self) -> None:
+        try:
+            subprocess.run(
+                self._extract_argv(),
+                capture_output=True,
+                timeout=20,
+                check=True,
+                # Don't flash a console window when running as a packaged (windowed) .exe
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            raw = RAW_TXT.read_text(encoding="utf-8")
+            self.queue.put(("ok", raw))
+        except subprocess.CalledProcessError as e:
+            message = (e.stderr or b"").decode("utf-8", errors="replace").strip() or str(e)
+            # Exit code 2 is the extractor saying there is nothing to read yet (captions
+            # off, meeting not open), with a line of advice. Anything else is a fault.
+            self.queue.put(("waiting" if e.returncode == 2 else "error", message))
+        except Exception as e:
+            self.queue.put(("error", str(e)))
+        finally:
+            self._extract_busy = False
+
+    def _drain_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "ok":
+                    self._handle_extract(payload)
+                elif kind == "waiting":
+                    # Not an error: say what to do, and do not count it as a failure.
+                    self.status.set(payload.splitlines()[0] if payload else "Waiting for captions.")
+                else:
+                    self.error_count += 1
+                    self.status.set(f"Extractor error ({self.error_count}): {payload.splitlines()[0] if payload else 'unknown'}")
+        except queue.Empty:
+            pass
+        self.root.after(200, self._drain_queue)
+
+    def _handle_extract(self, raw: str) -> None:
+        self.last_poll_time = datetime.now()
+        snapshot = teams_caption.read_snapshot(raw)
+        if snapshot is not None:
+            window, entries = snapshot
+            changes = self._teams_ledger.accept(window, entries)
+            for action, index, item in changes:
+                speaker = item.speaker or teams_caption.UNKNOWN
+                if action == "update" and index in self._teams_indices:
+                    self._replace_entry(self._teams_indices[index], speaker, item.text)
+                else:
+                    self._teams_indices[index] = len(self.captured)
+                    self._append(speaker, item.text)
+            self._refresh_stats()
+            unknown = sum(1 for item in self._teams_ledger.entries if not item.speaker)
+            self.status.set(f"Teams: {len(self._teams_ledger.entries)} captions · {unknown} without a speaker name")
+            return
+        items = parse_raw(raw)
+        added = 0
+        for speaker, text in items:
+            norm = normalize_text(text)
+            key = (speaker, norm)
+            if not norm or key in self.seen_norm:
+                continue
+            # Every version stays in seen_norm, so a stale copy of a caption that has since
+            # been revised cannot come back as a new entry once it is out of reach.
+            self.seen_norm.add(key)
+            found = self._find_revision(speaker, text)
+            if found is not None:
+                i, merged = found
+                if merged != self.captured[i][1]:
+                    self.seen_norm.add((speaker, normalize_text(merged)))
+                    self._replace_entry(i, speaker, merged)
+                continue
+            self._append(speaker, text)
+            added += 1
+
+        self._refresh_stats()
+        stamp = self.last_poll_time.strftime("%H:%M:%S")
+        if added:
+            self.status.set(f"Last poll {stamp} — added {added} new caption(s).")
+        else:
+            self.status.set(f"Last poll {stamp} — no new captions.")
+
+    def _record(self, speaker: str | None, text: str, tag: str | None) -> None:
+        """Add an entry to captured, keeping _entry_tags parallel to it."""
+        self.captured.append((speaker, text))
+        self._entry_tags.append(tag)
+
+    def _append(self, speaker: str | None, text: str) -> None:
+        """Add a live caption at the end, tagged so a later revision can rewrite it."""
+        at_end = self.text.yview()[1] > 0.98
+        tag = f"cap{self._tag_seq}"
+        self._tag_seq += 1
+        self.text.insert("end", f"{speaker}: {text}" if speaker else text, (tag,))
+        self.text.insert("end", "\n\n")
+        self._record(speaker, text, tag)
+        if at_end:
+            self.text.see("end")
+
+    def _find_revision(self, speaker: str | None, text: str) -> tuple[int, str] | None:
+        """(index, merged text) of the recent live caption this one rewrites, or None.
+
+        Looks back over the last few entries, newest first, for one from the same speaker
+        that this caption revises. Only live captions qualify: an imported transcript or
+        a Whisper chunk is final, and a short caption could otherwise "revise" a whole
+        imported meeting away.
+        """
+        lowest = max(0, len(self.captured) - REVISION_LOOKBACK)
+        for i in range(len(self.captured) - 1, lowest - 1, -1):
+            prev_speaker, prev_text = self.captured[i]
+            if not self._entry_tags[i] or prev_speaker != speaker:
+                continue
+            merged = merge_caption(prev_text, text)
+            if merged is not None:
+                return i, merged
+        return None
+
+    def _replace_entry(self, index: int, speaker: str | None, text: str) -> None:
+        """Rewrite one entry where it stands, leaving the rest of the text as it is.
+
+        The old code rebuilt the whole widget from its text to change the last entry, so
+        it could only ever touch the last one. A tag per entry finds any of them, and
+        edits the user made to other entries survive.
+        """
+        self.captured[index] = (speaker, text)
+        tag = self._entry_tags[index]
+        line = f"{speaker}: {text}" if speaker else text
+        at_end = self.text.yview()[1] > 0.98
+        ranges = self.text.tag_ranges(tag) if tag else ()
+        if ranges:
+            start = self.text.index(ranges[0])
+            self.text.delete(ranges[0], ranges[-1])
+            self.text.insert(start, line, (tag,))
+        else:
+            # The user deleted this entry's text. Put the revision at the end rather than
+            # guess where it belonged.
+            self.text.insert("end", line, (tag,))
+            self.text.insert("end", "\n\n")
+        if at_end:
+            self.text.see("end")
+
+    def copy_all(self) -> None:
+        text = self.text.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showinfo("Nothing to copy", "No captions captured yet.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.status.set(f"Copied {len(text):,} chars to clipboard.")
+
+    def save_as(self) -> None:
+        """Download the transcript as Markdown or plain text, into Downloads by default."""
+        text = self.text.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showinfo("Nothing to download", "The transcript is empty.")
+            return
+        name = f"Meeting transcript {datetime.now():%Y-%m-%d %H%M}"
+        try:
+            path = transcript_export.save_transcript(self.root, text, filename=name, title=name)
+        except OSError as e:
+            messagebox.showerror("Could not save", f"{type(e).__name__}: {e}")
+            return
+        if path:
+            self.status.set(f"Saved to {path}")
+
+    def clear(self) -> None:
+        if self.captured and not messagebox.askyesno(
+            "Clear captured?", "Discard all captured captions?"
+        ):
+            return
+        self._reset_transcript()
+        self.status.set("Cleared.")
+
+    def _reset_transcript(self) -> None:
+        """Empty the transcript and everything derived from it, without asking."""
+        self.captured.clear()
+        self._entry_tags.clear()
+        self.seen_norm.clear()
+        self._teams_ledger = teams_caption.CaptionLedger()
+        self._teams_indices.clear()
+        self.text.delete("1.0", "end")
+        self._refresh_stats()
+        self.meeting_id = None
+        self.last_indexed_doc_id = None
+        if hasattr(self, "assist_panel"):
+            self.assist_panel.reset()
+
+    def _refresh_ollama_models(self) -> None:
+        models = list_ollama_models()
+        self._ollama_models_cache = models
+        self.ollama_model_box["values"] = models
+        if models and not self.ollama_model_var.get():
+            self.ollama_model_var.set(pick_default_ollama_model(models) or models[0])
+
+    def _resolve_backend_silent(self) -> tuple[str, str | None] | None:
+        """Backend resolution for background polling — no dialogs, no prompts.
+        Auto mode now prefers Ollama (free, local) over Claude (paid)."""
+        choice = self.backend_var.get()
+        has_key = bool(get_api_key())
+        if choice == "Claude":
+            return ("claude", None) if has_key else None
+        if choice == "Ollama":
+            if not self._ollama_models_cache:
+                self._refresh_ollama_models()
+            model = self.ollama_model_var.get() or (
+                self._ollama_models_cache[0] if self._ollama_models_cache else None
+            )
+            return ("ollama", model) if model else None
+        # Auto: prefer Ollama if available (free), else Claude
+        if not self._ollama_models_cache:
+            self._refresh_ollama_models()
+        if self._ollama_models_cache:
+            model = self.ollama_model_var.get() or pick_default_ollama_model(self._ollama_models_cache)
+            return ("ollama", model)
+        if has_key:
+            return ("claude", None)
+        return None
+
+    def _show_ai_controls(self, show: bool) -> None:
+        for widget, opts in self._ai_controls:
+            if show:
+                widget.pack(**opts)
+            else:
+                widget.pack_forget()
+
+    def _apply_transcript_only(self, save: bool = True) -> None:
+        """Switch between the full copilot and a plain transcript with AI off.
+
+        Off means nothing that talks to a model runs: the assist panel stops polling
+        and leaves the window, the AI engine controls and Summarize go, and background
+        indexing into the knowledge base pauses, since that feeds the AI and can call
+        OpenAI when its embeddings are configured. Capture is untouched.
+        """
+        off = self.transcript_only.get()
+        panes = [str(p) for p in self.main_paned.panes()]
+        if off:
+            self.assist_panel.stop()
+            if str(self.assist_panel) in panes:
+                self.main_paned.forget(self.assist_panel)
+            self._show_ai_controls(False)
+            self.set_status("Transcript only: AI and the assist panel are off.")
+        else:
+            self._show_ai_controls(True)
+            if not self._ollama_models_cache:
+                self._refresh_ollama_models()
+            if str(self.assist_panel) not in panes:
+                self.main_paned.add(self.assist_panel, weight=2)
+                self.root.after(50, self._set_initial_sash)
+            if self._kb_ready:
+                self.assist_panel.start()
+            self.set_status("AI assist is on again.")
+        self._refresh_stats()
+        if save:
+            cfg = cfg_mod.get_config()
+            cfg["ui"]["transcript_only"] = off
+            cfg_mod.save_config(cfg)
+
+    def _resolve_backend(self) -> tuple[str, str | None] | None:
+        """Returns (backend, ollama_model) or None if user cancelled."""
+        choice = self.backend_var.get()
+        has_key = bool(get_api_key())
+
+        if choice == "Claude":
+            if not has_key:
+                key = prompt_for_api_key(self.root)
+                if not key:
+                    return None
+            return ("claude", None)
+
+        if choice == "Ollama":
+            self._refresh_ollama_models()
+            model = self.ollama_model_var.get() or (self._ollama_models_cache[0]
+                                                     if self._ollama_models_cache else None)
+            if not model:
+                messagebox.showerror(
+                    "No Ollama models",
+                    "No Ollama models found. Open Ollama and run e.g. `ollama pull llama3.1`."
+                )
+                return None
+            return ("ollama", model)
+
+        # Auto: prefer Ollama (free), fall back to Claude
+        self._refresh_ollama_models()
+        if self._ollama_models_cache:
+            model = self.ollama_model_var.get() or pick_default_ollama_model(self._ollama_models_cache)
+            return ("ollama", model)
+        if has_key:
+            return ("claude", None)
+        # nothing available — offer to set Claude key
+        if messagebox.askyesno(
+            "No backend configured",
+            "No Anthropic API key and no Ollama models found.\n\nSet up an Anthropic API key now?"
+        ):
+            key = prompt_for_api_key(self.root)
+            if key:
+                return ("claude", None)
+        return None
+
+    def summarize(self) -> None:
+        text = self.text.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showinfo("Nothing to summarize", "Capture some transcript first.")
+            return
+        self.summarize_text(text)
+
+    def summarize_text(self, text: str) -> None:
+        """Summarize arbitrary text — the live transcript, or an imported one."""
+        if self.transcript_only.get():
+            messagebox.showinfo(
+                "AI is off",
+                "Cue is in Transcript only mode, so Summarize is off.\n\n"
+                "Untick “Transcript only (AI off)” above the transcript to turn AI back on.",
+            )
+            return
+        resolved = self._resolve_backend()
+        if not resolved:
+            return
+        backend, model = resolved
+        SummaryWindow(self.root, transcript=text, backend=backend, ollama_model=model)
+
+    def transcribe_file(self, path: str | None = None) -> None:
+        """Transcribe an audio/video file you already have (voice note, recording).
+
+        Separate from the capture sources, which listen to audio happening now.
+        """
+        try:
+            from transcribe_window import TranscribeWindow
+        except ImportError as e:
+            messagebox.showerror(
+                "Transcribe unavailable",
+                f"The file-transcription window couldn't be loaded.\n\n{e}"
+            )
+            return
+        TranscribeWindow(
+            self.root,
+            initial_path=path,
+            on_summarize=self.summarize_text,
+            on_insert=self.append_transcript,
+        )
+
+    def open_transcript_file(self, path: str | None = None) -> None:
+        """Load a finished meeting's transcript so Summarize and the assist panel use it.
+
+        For the files a meeting leaves behind: the captions Zoom saves next to a local
+        recording, a Teams transcript download (.vtt or .docx), or a transcript Cue saved
+        earlier. Audio and video go through Transcribe a file instead.
+        """
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open transcript file",
+                filetypes=[
+                    ("Transcript files", "*.vtt *.srt *.txt *.docx *.md"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not path:
+                return
+        try:
+            text = transcript_cleaner.prepare_for_cue(transcript_cleaner.load_file(Path(path)))
+        except Exception as e:  # noqa: BLE001 - surfaced to the user
+            messagebox.showerror("Could not open transcript", f"{type(e).__name__}: {e}")
+            return
+        if not text:
+            messagebox.showinfo("Nothing to open", "That file has no transcript text in it.")
+            return
+        if self.text.get("1.0", "end-1c").strip():
+            choice = messagebox.askyesnocancel(
+                "Open transcript file",
+                "Replace the current transcript with this file?\n\n"
+                "Yes replaces it. No adds the file after it. Cancel leaves things as they are.",
+            )
+            if choice is None:
+                return
+            if choice:
+                self._reset_transcript()
+        self.append_transcript(text)
+        self.set_status(f"Opened {Path(path).name}. Summarize (Ctrl+Enter) and the assist "
+                        "panel now work on it.")
+
+    def import_recording(self) -> None:
+        """Read the transcript pane of a Teams recording the tenant won't let you download."""
+        from recording_window import RecordingImportWindow
+        RecordingImportWindow(self.root, on_insert=self.append_transcript,
+                              on_summarize=self.summarize_text)
+
+    def append_transcript(self, text: str) -> None:
+        """Append imported text to the live transcript so the assist panel picks it up."""
+        block = text.strip()
+        if not block:
+            return
+        self._record(None, block, None)
+        self.seen_norm.add(normalize_text(block))
+        self.text.insert("end", block + "\n\n")
+        self.text.see("end")
+        self._refresh_stats()
+        self.set_status("Imported transcript added — brief and questions will use it.")
+
+    def set_key(self) -> None:
+        prompt_for_api_key(self.root)
+
+    def open_settings(self) -> None:
+        SettingsWindow(self.root)
+
+    def start_ollama(self) -> None:
+        import ollama_util
+        if ollama_util.is_ollama_up():
+            self.set_status("Ollama is already running.")
+            self._refresh_ollama_models()
+            return
+        self.set_status("Starting Ollama engine…")
+
+        def work() -> None:
+            ok = ollama_util.launch_ollama()
+            def done() -> None:
+                if ok:
+                    self.set_status("Ollama engine started.")
+                    self._refresh_ollama_models()
+                else:
+                    messagebox.showwarning(
+                        "Couldn't start Ollama",
+                        "Ollama isn't installed or isn't on PATH.\n\n"
+                        "Install it from https://ollama.com, then run a model once:\n"
+                        "    ollama pull llama3.1\n\n"
+                        "Tip: opening the Ollama app from the Start menu keeps it "
+                        "running in the tray and auto-starts on login."
+                    )
+                    self.set_status("Ollama not available.")
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_config_change(self, new_cfg: dict) -> None:
+        """Live update runtime values when settings are saved."""
+        try:
+            self.auto_index_interval_sec = int(new_cfg["cadence"].get("auto_index_interval_sec", 600))
+            self.poll_seconds.set(int(new_cfg["cadence"].get("caption_poll_sec", 4)))
+            if hasattr(self, "assist_panel"):
+                self.assist_panel.brief_interval.set(
+                    int(new_cfg["cadence"].get("brief_interval_sec", 120))
+                )
+                self.assist_panel.questions_interval.set(
+                    int(new_cfg["cadence"].get("questions_interval_sec", 180))
+                )
+                self.assist_panel.points_interval.set(
+                    int(new_cfg["cadence"].get("points_interval_sec", 150))
+                )
+            self.set_status("Settings updated.")
+        except Exception as e:
+            self.set_status(f"Settings change error: {e}")
+
+    def _schedule_auto_index(self) -> None:
+        self.auto_index_after_id = self.root.after(
+            self.auto_index_interval_sec * 1000, self._auto_index_tick
+        )
+
+    def _auto_index_tick(self) -> None:
+        self._schedule_auto_index()
+        if self.transcript_only.get():
+            return
+        transcript = self.text.get("1.0", "end-1c")
+        if len(transcript) < self.auto_index_min_chars:
+            return
+        if not self.meeting_id:
+            self.meeting_id = f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        threading.Thread(target=self._do_index, args=(transcript, False), daemon=True).start()
+
+    def _do_index(self, transcript: str, notify: bool) -> None:
+        try:
+            if self.last_indexed_doc_id:
+                kb.delete_document(self.last_indexed_doc_id)
+            info = kb.index_transcript(transcript, title=self.meeting_id)
+            self.last_indexed_doc_id = info.get("doc_id") or None
+            chunks = info.get("chunks", 0)
+            self.root.after(0, lambda c=chunks: self.set_status(
+                f"Transcript indexed into KB · {c} chunks · meeting '{self.meeting_id}'"
+            ))
+            if notify:
+                self.root.after(0, lambda c=chunks: messagebox.showinfo(
+                    "Archived",
+                    f"Current transcript indexed into the knowledge base as '{self.meeting_id}' ({c} chunks)."
+                ))
+        except Exception as e:
+            err = e
+            self.root.after(0, lambda er=err: self.set_status(
+                f"Auto-index error: {type(er).__name__}: {er}"
+            ))
+
+    def archive_now(self) -> None:
+        transcript = self.text.get("1.0", "end-1c")
+        if not transcript.strip():
+            messagebox.showinfo("Nothing to archive", "Capture some transcript first.")
+            return
+        if not self.meeting_id:
+            self.meeting_id = f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        threading.Thread(target=self._do_index, args=(transcript, True), daemon=True).start()
+
+    def add_doc(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Add document(s) to knowledge base",
+            filetypes=[
+                ("Supported", "*.pdf *.docx *.txt *.md *.markdown *.vtt *.srt"),
+                ("PDF", "*.pdf"),
+                ("Word", "*.docx"),
+                ("Text/Markdown", "*.txt *.md *.markdown"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        self.set_status(f"Indexing {len(paths)} file(s) — first run downloads ~90MB embed model…")
+        self.root.update_idletasks()
+
+        def work() -> None:
+            results = []
+            for p in paths:
+                try:
+                    results.append(("ok", kb.add_document(p)))
+                except Exception as e:
+                    results.append(("err", f"{Path(p).name}: {type(e).__name__}: {e}"))
+            self.root.after(0, lambda: self._after_index(results))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_index(self, results: list[tuple[str, object]]) -> None:
+        lines = []
+        added_chunks = 0
+        for status, info in results:
+            if status == "ok":
+                if info["already_indexed"]:
+                    lines.append(f"• {info['source']} — already in KB (skipped)")
+                else:
+                    lines.append(f"• {info['source']} — {info['chunks']} chunks indexed")
+                    added_chunks += info["chunks"]
+            else:
+                lines.append(f"✗ {info}")
+        messagebox.showinfo("Knowledge base updated", "\n".join(lines))
+        self.set_status(f"KB updated · {added_chunks} new chunks indexed.")
+
+    def manage_kb(self) -> None:
+        ManageKBWindow(self.root)
+
+    def _maybe_archive_on_close(self) -> bool:
+        """Per config.archive.on_close: ask/always/never. Returns True if we should
+        proceed to close, False if the user cancelled."""
+        transcript = self.text.get("1.0", "end-1c").strip()
+        if not transcript:
+            return True
+        mode = cfg_mod.get_config()["archive"].get("on_close", "ask")
+        if mode == "never":
+            return True
+        if mode == "ask":
+            ans = messagebox.askyesnocancel(
+                "Archive transcript?",
+                "Save the current meeting transcript into the knowledge base "
+                "before closing?\n\n(Yes = archive, No = discard, Cancel = stay open)"
+            )
+            if ans is None:
+                return False
+            if not ans:
+                return True
+        # mode == "always" or user said yes
+        try:
+            if not self.meeting_id:
+                self.meeting_id = f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            if self.last_indexed_doc_id:
+                kb.delete_document(self.last_indexed_doc_id)
+            kb.index_transcript(transcript, title=self.meeting_id)
+        except Exception as e:
+            messagebox.showerror("Archive failed", f"{type(e).__name__}: {e}")
+        return True
+
+    def _on_close(self) -> None:
+        if not self._maybe_archive_on_close():
+            return
+        self.running = False
+        if self.auto_index_after_id:
+            try:
+                self.root.after_cancel(self.auto_index_after_id)
+            except tk.TclError:
+                pass
+        if self.whisper is not None:
+            try:
+                self.whisper.stop()
+            except Exception:
+                pass
+        if hasattr(self, "assist_panel"):
+            self.assist_panel.stop()
+        self.root.destroy()
+
+
+class ManageKBWindow(tk.Toplevel):
+    """List documents in the knowledge base with delete support."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.title("Knowledge base")
+        self.geometry("720x440")
+        self.minsize(500, 300)
+
+        top = ttk.Frame(self, padding=(8, 8, 8, 0))
+        top.pack(fill="x")
+        self.summary = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.summary).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="Delete selected", command=self.delete_selected).pack(side="right", padx=(0, 6))
+
+        body = ttk.Frame(self, padding=8)
+        body.pack(fill="both", expand=True)
+        cols = ("source", "chunks", "added_at", "doc_id")
+        self.tree = ttk.Treeview(body, columns=cols, show="headings", selectmode="extended")
+        for c, w in zip(cols, (320, 70, 160, 130)):
+            self.tree.heading(c, text=c.replace("_", " ").title())
+            self.tree.column(c, width=w, anchor="w")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        docs = kb.list_documents()
+        total_chunks = sum(d["chunks"] for d in docs)
+        self.summary.set(f"{len(docs)} document(s) · {total_chunks} chunks total")
+        for d in docs:
+            self.tree.insert("", "end", iid=d["doc_id"],
+                             values=(d["source"], d["chunks"], d["added_at"], d["doc_id"]))
+
+    def delete_selected(self) -> None:
+        sel = list(self.tree.selection())
+        if not sel:
+            return
+        if not messagebox.askyesno("Delete?", f"Remove {len(sel)} document(s) from the knowledge base?"):
+            return
+        removed = 0
+        for doc_id in sel:
+            removed += kb.delete_document(doc_id)
+        messagebox.showinfo("Deleted", f"Removed {removed} chunks.")
+        self.refresh()
+
+
+def main() -> None:
+    # A frozen build has no interpreter to call, so speech workers are launched by
+    # re-running Cue.exe with --cue-worker. Catch that before any UI exists.
+    code = worker_ipc.maybe_run_worker()
+    if code is not None:
+        raise SystemExit(code)
+    if not EXTRACT_PS1.exists():
+        raise SystemExit(f"Missing required script: {EXTRACT_PS1}")
+    root = tk.Tk()
+    # Modern Windows 11 / macOS-style theme (Sun Valley), honoring saved preference.
+    try:
+        import sv_ttk
+        theme = cfg_mod.get_config()["ui"].get("theme", "light")
+        sv_ttk.set_theme(theme if theme in ("light", "dark") else "light")
+    except Exception:
+        try:
+            ttk.Style().theme_use("vista")
+        except tk.TclError:
+            pass
+    try:
+        if ICON_PATH.exists():
+            root.iconbitmap(default=str(ICON_PATH))
+    except tk.TclError:
+        pass
+    LiveCapture(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

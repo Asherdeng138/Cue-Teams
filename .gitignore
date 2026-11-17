@@ -1,0 +1,57 @@
+# Python and environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.pytest-tmp/
+.coverage
+htmlcov/
+
+# Build outputs and local scratch
+build/
+dist/
+work/
+outputs/
+*.exe
+*.dll
+*.zip
+*.lnk
+
+# Local application data and meeting content
+data/
+recordings/
+字幕记录/
+.meeting_workflow/
+CueData/
+config.json
+kb.jsonl
+*.npy
+teams_extracted_raw.txt
+teams_transcript_cleaned.txt
+会议字幕_*.txt
+会议字幕_*.json
+Teams_*.txt
+Teams_*.json
+_self_test*
+*.log
+
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*.json
+secrets*.json
+
+# Personal screenshots and editor files
+preview*.png
+*.local.*
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

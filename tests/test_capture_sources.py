@@ -1,0 +1,137 @@
+"""How each capture source targets a window.
+
+The Teams source was broken from the start: it looked for a top-level window whose
+title contains "Captions", and the current Teams client has no such window, because
+captions are a pane inside the meeting window. Every poll failed with "No window found
+whose title contains 'Captions'". Confirmed against a running Teams client.
+
+It now finds Teams by process instead. The important boundary is that this fallback is
+Teams-only: when someone picks a window by name, reading a different one instead would
+be worse than reading nothing.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import live_capture as lc
+
+pytestmark = pytest.mark.usefixtures("tk_root")
+
+
+@pytest.fixture
+def app(tk_root):
+    a = lc.LiveCapture(tk_root)
+    yield a
+    try:
+        a.assist_panel.stop()
+    except Exception:
+        pass
+
+
+def test_teams_source_asks_the_extractor_to_find_teams(app):
+    app.source_var.set("Teams desktop")
+    app.teams_mode = True
+    assert "-TeamsMode" in app._extract_argv()
+
+
+def test_a_picked_window_never_falls_back(app):
+    """If the user named a window, read that window or nothing."""
+    app.source_var.set("Pick a window…")
+    app.teams_mode = False
+    app.capture_window_title = "Zoom Meeting"
+    argv = app._extract_argv()
+    assert "-TeamsMode" not in argv
+    assert argv[argv.index("-WindowTitle") + 1] == "Zoom Meeting"
+
+
+def test_argv_always_carries_script_and_output_path(app):
+    argv = app._extract_argv()
+    assert argv[0] == "powershell"
+    assert "-ExecutionPolicy" in argv and "Bypass" in argv
+    assert str(lc.EXTRACT_PS1) in argv
+    assert str(lc.RAW_TXT) in argv[argv.index("-OutPath") + 1]
+
+
+def test_teams_mode_defaults_on(app):
+    """Teams desktop is the first entry in the dropdown, so the default matters."""
+    assert app.teams_mode is True
+
+
+def test_the_extractor_script_is_present():
+    assert lc.EXTRACT_PS1.exists(), f"missing {lc.EXTRACT_PS1}"
+
+
+def test_the_script_supports_the_teams_mode_switch():
+    """Guards against the Python side passing a flag the script would reject."""
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    assert "[switch]$TeamsMode" in src
+    assert "$TeamsProcess" in src
+    assert "ms-teams" in src, "the current Teams client's process name must be recognised"
+
+
+def test_the_script_still_prefers_a_real_captions_window():
+    """Classic Teams and third-party captioners do expose one; title match stays first."""
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    title_match = src.index("title:captions")
+    process_match = src.index('$strategy = "process"')
+    assert title_match < process_match, "title lookup must be attempted before the fallback"
+
+
+# --- Zoom desktop -------------------------------------------------------------
+
+def test_zoom_source_asks_the_extractor_to_find_zoom(app):
+    app.source_var.set("Zoom desktop")
+    app.teams_mode = False
+    app.zoom_mode = True
+    argv = app._extract_argv()
+    assert "-ZoomMode" in argv
+    assert "-TeamsMode" not in argv, "one app per poll; Zoom must not also read Teams"
+
+
+def test_zoom_mode_defaults_off(app):
+    assert app.zoom_mode is False
+
+
+def test_a_picked_window_never_reads_zoom(app):
+    app.source_var.set("Pick a window…")
+    app.teams_mode = False
+    app.zoom_mode = False
+    app.capture_window_title = "Zoom Meeting"
+    assert "-ZoomMode" not in app._extract_argv()
+
+
+def test_the_script_supports_the_zoom_mode_switch():
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    assert "[switch]$ZoomMode" in src
+    assert "$ZoomProcess" in src
+    # The caption overlay's window class: not localised, unlike the "Closed caption"
+    # list name, so it is what the lookup keys on first.
+    assert "ZConfCCRecieveWndExClass" in src
+
+
+def test_the_script_emits_explicit_speakers_for_zoom():
+    """Zoom keeps the speaker in its own control, so the script says who spoke
+    instead of leaving the parser to guess from line shape."""
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    assert '"[speaker] $speaker"' in src
+
+
+# --- several Teams windows ------------------------------------------------------
+
+def test_teams_lookup_prefers_the_window_showing_a_pane():
+    """Teams' main window in front of a popped-out recap or meeting window used to win
+    on z-order alone. It has no captions or transcript pane, so a recording import
+    failed and live capture read the chat list. Verified against a two-window
+    stand-in: before, "Main window [process]"; after, the window with the pane."""
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    assert "foreach ($w in $teamsWindows)" in src
+    search = src.index("Find-CaptionsRegion -Window $w")
+    fallback = src.index("$target = $teamsWindows[0]")
+    assert search < fallback, "every Teams window must be checked before falling back"
+
+
+def test_the_chosen_window_is_not_searched_twice():
+    """Live capture polls every few seconds; the pane search is the expensive part."""
+    src = lc.EXTRACT_PS1.read_text(encoding="utf-8", errors="replace")
+    assert "if (-not $regionSearched) { $region = Find-CaptionsRegion -Window $target }" in src
